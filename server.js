@@ -48,6 +48,13 @@ const EXTRA_ALIASES = (process.env.EXTRA_ALIASES || '')
   .filter(Boolean);
 const PORT = Number(process.env.PORT || 3000);
 
+// --- Ad popup config (per-visitor throttled) -------------------------------
+// Triggered when the visitor clicks the play button / video / iframe area.
+// Throttled per anime page (sessionStorage) AND globally (localStorage cooldown)
+// so it does not fire on every click or on every episode switch.
+const AD_URL = (process.env.AD_URL || 'https://omg10.com/4/10956241').trim();
+const AD_COOLDOWN_MIN = Number(process.env.AD_COOLDOWN_MIN || 30); // global cooldown in minutes
+
 // Hostnames in upstream content that must be rewritten to the mirror.
 const ALIAS_HOSTS = Array.from(new Set([UPSTREAM_HOST, ...EXTRA_ALIASES]));
 
@@ -66,9 +73,11 @@ const HOP_BY_HOP = new Set([
   'accept-encoding',
 ]);
 
-// Headers we strip from the upstream response.
+// Headers we strip from the upstream response unconditionally.
+// NOTE: 'content-length' is intentionally NOT here; we keep it for binary
+// streaming (videos, images) so the browser knows total bytes / can seek.
+// We will manually drop it on textual rewrites where size changes.
 const STRIP_RESPONSE_HEADERS = new Set([
-  'content-length',
   'content-encoding',
   'transfer-encoding',
   'connection',
@@ -140,6 +149,92 @@ function isTextual(contentType) {
     ct.includes('manifest')
   );
 }
+
+// --- Static asset cache headers --------------------------------------------
+// Browser & CDN cache hints so videos / images / css / js are not re-fetched
+// from upstream on every navigation. Aggressive but safe values; upstream's
+// own cache-control still wins if it sets one.
+const CACHE_RULES = [
+  { re: /\.(mp4|m4s|m3u8|ts|webm|mkv|mov|aac|mp3|ogg|wav)(\?|$)/i, ttl: 86400 * 7 },
+  { re: /\.(woff2?|ttf|otf|eot)(\?|$)/i,                            ttl: 86400 * 30 },
+  { re: /\.(png|jpe?g|gif|webp|avif|svg|ico|bmp)(\?|$)/i,           ttl: 86400 * 7 },
+  { re: /\.(css|js|mjs)(\?|$)/i,                                    ttl: 86400 },
+];
+function applyStaticCache(res, pathOrUrl, ct) {
+  if (res.getHeader('cache-control')) return; // upstream already set it
+  for (const r of CACHE_RULES) {
+    if (r.re.test(pathOrUrl)) {
+      res.setHeader('cache-control', `public, max-age=${r.ttl}, stale-while-revalidate=86400`);
+      return;
+    }
+  }
+  if (ct && (ct.startsWith('image/') || ct.startsWith('video/') || ct.startsWith('audio/') || ct.startsWith('font/'))) {
+    res.setHeader('cache-control', 'public, max-age=86400, stale-while-revalidate=86400');
+  }
+}
+
+// --- Stream upstream body straight to client (binary / video) --------------
+// Critical for video playback: do NOT buffer the whole response. Forwards
+// Range / Content-Range / Accept-Ranges and uses the original status (e.g.
+// 206 Partial Content) so video.js can seek and show the play button.
+function streamPassthrough(upstream, req, res, outHeaders, status) {
+  res.status(status);
+  for (const [k, v] of Object.entries(outHeaders)) res.setHeader(k, v);
+  // Only forward content-length when the upstream body wasn't compressed
+  // (Node's fetch auto-decompresses, so the byte length we forward differs
+  // from the compressed content-length the upstream advertised).
+  const upstreamEnc = (upstream.headers.get('content-encoding') || '').toLowerCase();
+  const cl = upstream.headers.get('content-length');
+  if (cl && !upstreamEnc) res.setHeader('content-length', cl);
+  const cr = upstream.headers.get('content-range');
+  if (cr) res.setHeader('content-range', cr);
+  if (!res.getHeader('accept-ranges')) {
+    const ar = upstream.headers.get('accept-ranges');
+    if (ar) res.setHeader('accept-ranges', ar);
+  }
+  applyStaticCache(res, req.path || req.originalUrl || '', upstream.headers.get('content-type') || '');
+
+  const body = upstream.raw.body;
+  if (!body) { res.end(); return; }
+  const node = Readable.fromWeb(body);
+  node.on('error', (e) => { try { res.destroy(e); } catch {} });
+  res.on('close', () => { try { node.destroy(); } catch {} });
+  node.pipe(res);
+}
+
+// --- Ad popup script (injected into HTML pages and embed iframes) ----------
+// Throttled: at most once per anime page (sessionStorage) AND once per
+// AD_COOLDOWN_MIN globally (localStorage). Triggers on the first user click
+// inside the player area / play button / video element. Falls back to a
+// regular new-tab anchor click if window.open is blocked.
+function buildAdScript() {
+  return `<script>(function(){try{
+var U=${JSON.stringify(AD_URL)},CD=${AD_COOLDOWN_MIN}*60*1000;
+var key='__mad_'+(location.pathname||'/');
+function pk(k,s){try{return s?sessionStorage.getItem(k):localStorage.getItem(k);}catch(e){return null;}}
+function pkS(k,v,s){try{(s?sessionStorage:localStorage).setItem(k,v);}catch(e){}}
+function ok(){if(pk(key,1))return false;var t=parseInt(pk('__mad_last',0)||'0',10);return Date.now()-t>CD;}
+var fired=false;
+function fire(ev){
+  if(fired||!ok())return;fired=true;
+  pkS(key,'1',1);pkS('__mad_last',String(Date.now()),0);
+  try{var w=window.open(U,'_blank','noopener,noreferrer');if(w){return;}}catch(e){}
+  try{var a=document.createElement('a');a.href=U;a.target='_blank';a.rel='noopener noreferrer';
+    (document.body||document.documentElement).appendChild(a);a.click();a.remove();}catch(e){}
+}
+function isPlayHit(t){
+  if(!t||!t.closest)return false;
+  return !!t.closest('video,.vjs-big-play-button,.vjs-play-control,.vjs-tech,[class*="play-button"],[class*="playBtn"],[id*="play"],iframe,#embed_holder,.player-embed,.video-content,.jw-display-icon-container,.plyr__control--overlaid');
+}
+document.addEventListener('click',function(e){if(isPlayHit(e.target))fire(e);},true);
+document.addEventListener('touchstart',function(e){if(isPlayHit(e.target))fire(e);},{capture:true,passive:true});
+// Also fire when an embedded iframe takes focus (mobile inline play).
+window.addEventListener('blur',function(){setTimeout(function(){
+  if(document.activeElement&&document.activeElement.tagName==='IFRAME')fire();
+},50);});
+}catch(e){}})();</script>`;
+}
+const AD_SCRIPT = buildAdScript();
 
 // --- HTML rewriting ---------------------------------------------------------
 
@@ -230,7 +325,8 @@ function rewriteHtml(html, publicOrigin, currentPath) {
   // 4. Inject canonical (and a basic robots tag) into <head>.
   const headInjection =
     canonicalTag +
-    (FORCE_INDEX ? '<meta name="robots" content="index,follow,max-image-preview:large">' : '');
+    (FORCE_INDEX ? '<meta name="robots" content="index,follow,max-image-preview:large">' : '') +
+    AD_SCRIPT;
 
   if (/<head[^>]*>/i.test(out)) {
     out = out.replace(/<head[^>]*>/i, (m) => `${m}${headInjection}`);
@@ -454,8 +550,7 @@ async function pipeEmbed(upstream, req, res, host) {
   }
 
   if (!isTextual(ct)) {
-    const buf = await upstream.bodyBuffer();
-    res.status(status).set(outHeaders).end(buf);
+    streamPassthrough(upstream, req, res, outHeaders, status);
     return;
   }
 
@@ -463,11 +558,18 @@ async function pipeEmbed(upstream, req, res, host) {
   // Rewrite the embed's own host AND any other third-party hosts in the body
   // to /__embed/<host>/... so all subresources stay on the mirror.
   body = rewriteThirdPartyToEmbed(body, publicOrigin);
-  // Relative URLs (no host) inside the embed will resolve relative to
-  // /__embed/<host>/<path> which is correct.
-
-  if (ct.includes('text/html') && !/charset=/i.test(ct)) {
-    outHeaders['content-type'] = 'text/html; charset=utf-8';
+  // If this is the embed's HTML, also inject the throttled ad popup script
+  // so clicks on the play button inside the iframe trigger it (clicks inside
+  // an iframe never reach the parent page).
+  if (ct.includes('text/html')) {
+    if (/<head[^>]*>/i.test(body)) {
+      body = body.replace(/<head[^>]*>/i, (m) => `${m}${AD_SCRIPT}`);
+    } else {
+      body = AD_SCRIPT + body;
+    }
+    if (!/charset=/i.test(ct)) {
+      outHeaders['content-type'] = 'text/html; charset=utf-8';
+    }
   }
   res.status(status).set(outHeaders).end(body);
 }
@@ -593,10 +695,11 @@ async function pipeUpstream(upstream, req, res) {
   const isXml = ct.includes('xml') || /\.xml(\?|$)/i.test(path);
   const isSitemap = /sitemap.*\.xml(\?|$)/i.test(path);
 
-  // For non-text bodies, stream straight through (re-encode safely).
+  // For non-text bodies, stream straight through (videos / images / fonts).
+  // We MUST NOT buffer mp4 / m3u8 chunks – that breaks seeking and the play
+  // button on video.js, and uses huge amounts of memory.
   if (!isTextual(ct) && !isSitemap) {
-    const buf = await upstream.bodyBuffer();
-    res.status(status).set(outHeaders).end(buf);
+    streamPassthrough(upstream, req, res, outHeaders, status);
     return;
   }
 
