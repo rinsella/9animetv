@@ -1,0 +1,18 @@
+{
+  "name": "9animetv-mirror",
+  "version": "1.0.0",
+  "description": "SEO-friendly reverse-proxy mirror for 9animetv.ing (Railway / Render / VPS).",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "undici": "^6.19.8"
+  }
+}
