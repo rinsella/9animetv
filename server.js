@@ -174,6 +174,27 @@ function rewriteHtml(html, publicOrigin, currentPath) {
   //     proxy path so the browser stays same-origin and we can fix Referer.
   out = rewriteThirdPartyToEmbed(out, publicOrigin);
 
+  // 1c. Player mirror <select> uses base64-encoded iframe HTML in option
+  //     `value="..."`; the page's JS decodes and injects it, bypassing any
+  //     plain HTML rewrite. Decode each option value, rewrite URLs inside,
+  //     then re-encode.
+  out = out.replace(
+    /(<option\b[^>]*\bvalue=)(["'])([A-Za-z0-9+/=]{16,})\2/gi,
+    (full, prefix, quote, b64) => {
+      try {
+        const decoded = Buffer.from(b64, 'base64').toString('utf8');
+        if (!/[<>]|https?:|\/\//i.test(decoded)) return full;
+        let rewritten = decoded.replace(HOST_REWRITE_RE, publicOrigin);
+        rewritten = rewriteThirdPartyToEmbed(rewritten, publicOrigin);
+        if (rewritten === decoded) return full;
+        const reb64 = Buffer.from(rewritten, 'utf8').toString('base64');
+        return `${prefix}${quote}${reb64}${quote}`;
+      } catch {
+        return full;
+      }
+    },
+  );
+
   // 2. Force a self-referencing canonical.
   const canonicalUrl = publicOrigin + currentPath;
   const canonicalTag = `<link rel="canonical" href="${escapeAttr(canonicalUrl)}">`;
