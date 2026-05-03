@@ -143,11 +143,36 @@ function isTextual(contentType) {
 
 // --- HTML rewriting ---------------------------------------------------------
 
+// Rewrite any absolute or protocol-relative URL pointing at a *third-party*
+// host (i.e. not the upstream / aliases / mirror) into a path-based reverse
+// proxy on the mirror itself. Used for video player iframes & their assets
+// served from hosts like `my.1anime.site` so the browser sees a same-origin
+// request and the upstream's referer-check still passes.
+function rewriteThirdPartyToEmbed(input, publicOrigin) {
+  if (!input) return input;
+  const publicHost = publicOrigin.replace(/^https?:\/\//, '').toLowerCase();
+  // Match http(s)://host or //host followed by /, ", ', space or end.
+  return input.replace(
+    /(href=|src=|action=|data-src=|data-url=|content=|url\(|=)?(["'(]?)(https?:)?\/\/([a-z0-9.-]+\.[a-z]{2,})(\/[^\s"'<>)]*)?/gi,
+    (match, attr, quote, proto, host, path) => {
+      const h = host.toLowerCase();
+      if (h === publicHost) return match;
+      if (ALIAS_HOSTS.some((a) => a.toLowerCase() === h)) return match;
+      const newUrl = `${publicOrigin}/__embed/${h}${path || '/'}`;
+      return `${attr || ''}${quote || ''}${newUrl}`;
+    },
+  );
+}
+
 function rewriteHtml(html, publicOrigin, currentPath) {
   let out = html;
 
   // 1. Replace any absolute upstream URL with the mirror origin.
   out = out.replace(HOST_REWRITE_RE, publicOrigin);
+
+  // 1b. Rewrite third-party hosts (video embeds, CDNs, etc.) to the embed
+  //     proxy path so the browser stays same-origin and we can fix Referer.
+  out = rewriteThirdPartyToEmbed(out, publicOrigin);
 
   // 2. Force a self-referencing canonical.
   const canonicalUrl = publicOrigin + currentPath;
@@ -315,6 +340,117 @@ app.get('/robots.txt', async (req, res) => {
   );
 });
 
+// --- Embed reverse-proxy ----------------------------------------------------
+// Generic per-host proxy used for video player iframes & their assets. Path:
+//   /__embed/<host>/<path...>?<query>
+// We forward Referer/Origin as the embed's own host so anti-hotlink checks
+// pass, and rewrite any absolute / third-party URLs in the response to keep
+// the browser on the mirror domain.
+
+const EMBED_PATH_RE = /^\/__embed\/([^\/]+)(\/.*)?$/;
+
+app.all(/^\/__embed\//, async (req, res) => {
+  const m = req.path.match(EMBED_PATH_RE);
+  if (!m) return res.status(400).type('text/plain').send('Bad embed path');
+  const host = m[1];
+  const restPath = m[2] || '/';
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host)) {
+    return res.status(400).type('text/plain').send('Bad embed host');
+  }
+  const qIdx = req.originalUrl.indexOf('?');
+  const query = qIdx >= 0 ? req.originalUrl.slice(qIdx) : '';
+  const targetUrl = `https://${host}${restPath}${query}`;
+
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (HOP_BY_HOP.has(k.toLowerCase())) continue;
+    if (Array.isArray(v)) headers[k] = v.join(', ');
+    else if (v != null) headers[k] = String(v);
+  }
+  headers['host'] = host;
+  headers['accept-encoding'] = 'gzip, br';
+  // Pretend we're embedded from the embed's own host so referer-checks pass.
+  headers['referer'] = `https://${host}/`;
+  headers['origin'] = `https://${host}`;
+
+  const init = {
+    method: req.method,
+    headers,
+    redirect: 'manual',
+  };
+  if (!['GET', 'HEAD'].includes(req.method.toUpperCase())) {
+    init.body = Readable.toWeb(req);
+    init.duplex = 'half';
+  }
+
+  let resp;
+  try {
+    resp = await fetch(targetUrl, init);
+  } catch (err) {
+    console.error('[embed proxy error]', host, err.message);
+    return res.status(502).type('text/plain').send('Embed gateway error');
+  }
+  const upstream = wrapResponse(resp);
+  await pipeEmbed(upstream, req, res, host);
+});
+
+async function pipeEmbed(upstream, req, res, host) {
+  const publicOrigin = publicOriginFromReq(req);
+  const publicHost = publicOrigin.replace(/^https?:\/\//, '');
+  const status = upstream.status;
+  const ct = upstream.headers.get('content-type') || '';
+
+  const outHeaders = {};
+  upstream.headers.forEach((value, key) => {
+    const lk = key.toLowerCase();
+    if (STRIP_RESPONSE_HEADERS.has(lk)) return;
+    if (lk === 'set-cookie') return;
+    if (lk === 'x-frame-options') return; // allow embedding on mirror
+    if (lk === 'location') {
+      // Rewrite redirects to stay inside the mirror.
+      let loc = value;
+      try {
+        const u = new URL(loc, `https://${host}`);
+        outHeaders['location'] = `${publicOrigin}/__embed/${u.host}${u.pathname}${u.search}`;
+      } catch {
+        outHeaders['location'] = loc;
+      }
+      return;
+    }
+    outHeaders[key] = value;
+  });
+
+  // Rewrite cookies' Domain so the browser keeps them on the mirror.
+  const rawCookies = upstream.raw.headers.getSetCookie
+    ? upstream.raw.headers.getSetCookie()
+    : upstream.headers.get('set-cookie');
+  const cookies = rewriteSetCookie(rawCookies, publicHost);
+  if (cookies.length) res.setHeader('set-cookie', cookies);
+
+  if (status >= 300 && status < 400 && outHeaders['location']) {
+    res.status(status).set(outHeaders).end();
+    return;
+  }
+
+  if (!isTextual(ct)) {
+    const buf = await upstream.bodyBuffer();
+    res.status(status).set(outHeaders).end(buf);
+    return;
+  }
+
+  let body = await upstream.bodyText();
+  // Rewrite the embed's own host AND any other third-party hosts in the body
+  // to /__embed/<host>/... so all subresources stay on the mirror.
+  body = rewriteThirdPartyToEmbed(body, publicOrigin);
+  // Relative URLs (no host) inside the embed will resolve relative to
+  // /__embed/<host>/<path> which is correct.
+
+  if (ct.includes('text/html') && !/charset=/i.test(ct)) {
+    outHeaders['content-type'] = 'text/html; charset=utf-8';
+  }
+  res.status(status).set(outHeaders).end(body);
+}
+
 // --- Catch-all proxy --------------------------------------------------------
 
 app.all('*', async (req, res) => {
@@ -452,6 +588,7 @@ async function pipeUpstream(upstream, req, res) {
   } else {
     // JSON, JS, CSS, plain text – just rewrite absolute URLs.
     body = rewriteUrlString(body, publicOrigin);
+    body = rewriteThirdPartyToEmbed(body, publicOrigin);
   }
 
   // Force a clean utf-8 content-type if upstream omitted charset for HTML.
