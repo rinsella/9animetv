@@ -1,6 +1,6 @@
 # 9animetv mirror
 
-SEO‑aware reverse‑proxy mirror untuk `9anime.me.uk` (atau upstream lain).
+SEO‑aware reverse‑proxy mirror untuk `9animetv.ing` (atau upstream lain).
 Pengganti script Cloudflare Workers, bisa di‑deploy ke **Railway**, **Render**,
 **Fly.io**, atau **VPS pribadi** (Node 18+ / Docker).
 
@@ -23,13 +23,13 @@ muncul pada situs mirror:
 
 | Var | Default | Keterangan |
 | --- | --- | --- |
-| `UPSTREAM_HOST` | `9anime.me.uk` | Hostname asli yang di‑mirror. |
+| `UPSTREAM_HOST` | `9animetv.ing` | Hostname asli yang di‑mirror. |
 | `UPSTREAM_PROTOCOL` | `https` | `http` / `https`. |
 | `PUBLIC_HOST` | *(auto)* | Paksa hostname publik (kalau kosong, dideteksi dari header `Host` / `X-Forwarded-Host`). |
 | `PUBLIC_PROTOCOL` | `https` | Protokol publik mirror. |
 | `PORT` | `3000` | Port listen. Railway/Render/Fly otomatis set. |
 | `FORCE_INDEX` | `1` | Hapus segala `noindex` dari upstream. |
-| `EXTRA_ALIASES` | *(kosong)* | Comma list hostname tambahan di upstream yang juga harus di‑rewrite (mis. `cdn.9anime.me.uk,api.9anime.me.uk`). |
+| `EXTRA_ALIASES` | *(kosong)* | Comma list hostname tambahan di upstream yang juga harus di‑rewrite (mis. `cdn.9animetv.ing,api.9animetv.ing`). |
 
 ---
 
@@ -40,7 +40,7 @@ muncul pada situs mirror:
 1. Push repo ini ke GitHub.
 2. Di Railway → **New Project → Deploy from GitHub repo** → pilih repo.
 3. Tambahkan env var:
-   - `UPSTREAM_HOST=9anime.me.uk`
+   - `UPSTREAM_HOST=9animetv.ing`
    - `PUBLIC_HOST=<domain-mirror-anda>` (mis. `9animetv.example.com`)
    - `PUBLIC_PROTOCOL=https`
 4. Tambahkan **Custom Domain** Railway → arahkan DNS CNAME ke target Railway.
@@ -56,7 +56,7 @@ muncul pada situs mirror:
 
 ```bash
 fly launch --no-deploy --name 9animetv-mirror
-fly secrets set UPSTREAM_HOST=9anime.me.uk PUBLIC_HOST=<domain-anda> PUBLIC_PROTOCOL=https FORCE_INDEX=1
+fly secrets set UPSTREAM_HOST=9animetv.ing PUBLIC_HOST=<domain-anda> PUBLIC_PROTOCOL=https FORCE_INDEX=1
 fly deploy
 ```
 
@@ -68,7 +68,7 @@ cd 9animetv
 docker build -t 9animetv-mirror .
 docker run -d --restart=always \
   -p 3000:3000 \
-  -e UPSTREAM_HOST=9anime.me.uk \
+  -e UPSTREAM_HOST=9animetv.ing \
   -e PUBLIC_HOST=mirror.example.com \
   -e PUBLIC_PROTOCOL=https \
   -e FORCE_INDEX=1 \
@@ -93,7 +93,7 @@ Caddy otomatis mengambil sertifikat Let's Encrypt.
 # Node 18+ wajib
 nvm install 20 && nvm use 20
 npm install --omit=dev
-PORT=3000 UPSTREAM_HOST=9anime.me.uk PUBLIC_HOST=mirror.example.com node server.js
+PORT=3000 UPSTREAM_HOST=9animetv.ing PUBLIC_HOST=mirror.example.com node server.js
 # atau pakai pm2:
 pm2 start server.js --name 9animetv-mirror
 ```
